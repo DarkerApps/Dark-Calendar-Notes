@@ -69,7 +69,6 @@ jobs:
           echo "===== build output ====="
           ls -la .output .output/public .output/server dist dist/client 2>/dev/null || true
 
-          # Prerender "/" by running the built server and saving its HTML
           SERVER_ENTRY=""
           if [ -f ".output/server/index.mjs" ]; then
             SERVER_ENTRY=".output/server/index.mjs"
@@ -120,7 +119,7 @@ jobs:
               if(!d){
                 d=document.createElement('pre');
                 d.id='__err';
-                d.style.cssText='position:fixed;left:0;right:0;bottom:0;max-height:50%;overflow:auto;margin:0;padding:8px;background:#300;color:#fff;font:11px monospace;z-index:2147483647;white-space:pre-wrap';
+                d.style.cssText='position:fixed;left:0;right:0;top:0;max-height:30%;overflow:auto;margin:0;padding:8px;background:#300;color:#fff;font:11px monospace;z-index:2147483647;white-space:pre-wrap';
                 (document.body||document.documentElement).appendChild(d);
               }
               d.textContent+=m+'\\n';
@@ -132,15 +131,19 @@ jobs:
 
           index_path = os.path.join(assets_out, "index.html")
           html = None
+          source = "unknown"
 
           if os.path.isfile(index_path):
               print("index.html already present in build output")
+              source = "build-output"
               html = open(index_path, encoding="utf-8").read()
           elif os.path.isfile(ssr_html) and "<script" in open(ssr_html, encoding="utf-8", errors="ignore").read():
               print("Using prerendered SSR HTML as index.html")
+              source = "ssr"
               html = open(ssr_html, encoding="utf-8", errors="ignore").read()
           else:
               print("Synthesizing index.html from client bundle...")
+              source = "synthesized"
               css_files, entry_js = [], None
               for mf in [os.path.join(assets_out, ".vite", "manifest.json"), "dist/client/.vite/manifest.json"]:
                   if os.path.isfile(mf):
@@ -178,9 +181,7 @@ jobs:
               )
               print("entry_js =", entry_js, "css =", css_files)
 
-          # strip service worker registration scripts
           html = re.sub(r'<script[^>]*registerSW[^>]*>\s*</script>', '', html)
-          # inject on-screen error overlay at start of <head>
           if re.search(r'<head[^>]*>', html):
               html = re.sub(r'(<head[^>]*>)', lambda m: m.group(1) + OVERLAY, html, count=1)
           else:
@@ -188,14 +189,14 @@ jobs:
 
           with open(index_path, "w", encoding="utf-8") as fp:
               fp.write(html)
-          print("Wrote index.html, bytes:", len(html))
+          print("index.html source =", source, "bytes =", len(html))
           PYEOF
           python3 "$GITHUB_WORKSPACE/assemble.py"
 
           echo "Final assets root contents:"
           ls -la "$ASSETS_OUT/"
-          echo "===== index.html (first 3000 chars) ====="
-          head -c 3000 "$ASSETS_OUT/index.html"; echo
+          echo "===== index.html (first 4000 chars) ====="
+          head -c 4000 "$ASSETS_OUT/index.html"; echo
 
       - name: Create Dark Notes Offline Android Project
         run: |
@@ -283,8 +284,8 @@ jobs:
               applicationId "com.priyamrai.darknotes"
               minSdk 24
               targetSdk 34
-              versionCode 1
-              versionName "1.0"
+              versionCode 2
+              versionName "1.1-debug"
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -368,25 +369,68 @@ jobs:
           import android.graphics.Color;
           import android.net.Uri;
           import android.os.Bundle;
+          import android.text.method.ScrollingMovementMethod;
+          import android.view.Gravity;
           import android.view.ViewGroup;
+          import android.webkit.ConsoleMessage;
           import android.webkit.WebChromeClient;
           import android.webkit.WebResourceRequest;
           import android.webkit.WebResourceResponse;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
+          import android.widget.FrameLayout;
+          import android.widget.TextView;
           import androidx.appcompat.app.AppCompatActivity;
           import androidx.webkit.WebViewAssetLoader;
           import androidx.webkit.WebViewClientCompat;
 
           public class MainActivity extends AppCompatActivity {
             private WebView webView;
+            private TextView dbg;
+            private final StringBuilder logBuf = new StringBuilder();
+
+            private static final String DUMP_JS =
+              "(function(){var r=document.getElementById('root');"
+              + "var imgs=Array.prototype.map.call(document.images,function(i){return i.src+'|'+i.complete+'|'+i.naturalWidth;}).join(',');"
+              + "return 'bodyLen='+document.body.innerHTML.length+' rootLen='+(r?r.innerHTML.length:'none')"
+              + "+' scripts='+document.scripts.length+' imgs='+imgs"
+              + "+' text='+document.body.innerText.slice(0,200);})()";
+
+            private void log(final String s) {
+              runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                  logBuf.insert(0, s + "\n");
+                  if (logBuf.length() > 6000) logBuf.setLength(6000);
+                  if (dbg != null) dbg.setText(logBuf.toString());
+                }
+              });
+            }
 
             @Override
             protected void onCreate(Bundle savedInstanceState) {
               super.onCreate(savedInstanceState);
+
+              FrameLayout root = new FrameLayout(this);
               webView = new WebView(this);
-              webView.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+              webView.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
               webView.setBackgroundColor(Color.BLACK);
+              root.addView(webView);
+
+              dbg = new TextView(this);
+              dbg.setTextColor(0xFF00FF66);
+              dbg.setBackgroundColor(0xEE111111);
+              dbg.setTextSize(10);
+              dbg.setTypeface(android.graphics.Typeface.MONOSPACE);
+              dbg.setMovementMethod(new ScrollingMovementMethod());
+              dbg.setPadding(8, 8, 8, 8);
+              int h = (int) (getResources().getDisplayMetrics().heightPixels * 0.40f);
+              FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, h);
+              lp.gravity = Gravity.BOTTOM;
+              root.addView(dbg, lp);
+
+              log("Dark Notes debug build 2");
+
               WebSettings settings = webView.getSettings();
               settings.setJavaScriptEnabled(true);
               settings.setDomStorageEnabled(true);
@@ -394,10 +438,19 @@ jobs:
               settings.setAllowFileAccess(false);
               settings.setAllowContentAccess(false);
               settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
+
               final WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder()
                   .addPathHandler("/", new WebViewAssetLoader.AssetsPathHandler(this))
                   .build();
-              webView.setWebChromeClient(new WebChromeClient());
+
+              webView.setWebChromeClient(new WebChromeClient() {
+                @Override
+                public boolean onConsoleMessage(ConsoleMessage cm) {
+                  log("JS " + cm.messageLevel() + ": " + cm.message() + " @" + cm.sourceId() + ":" + cm.lineNumber());
+                  return true;
+                }
+              });
+
               webView.setWebViewClient(new WebViewClientCompat() {
                 @Override
                 public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
@@ -408,11 +461,38 @@ jobs:
                     if (path == null || !path.contains(".")) {
                       return assetLoader.shouldInterceptRequest(Uri.parse("https://appassets.androidplatform.net/index.html"));
                     }
+                    log("MISSING: " + path);
+                  } else if (response == null) {
+                    log("EXTERNAL: " + url);
                   }
                   return response;
                 }
+
+                @Override
+                public void onPageFinished(WebView view, String url) {
+                  log("page finished: " + url);
+                  webView.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                      webView.evaluateJavascript(DUMP_JS, new android.webkit.ValueCallback<String>() {
+                        @Override
+                        public void onReceiveValue(String v) { log("DOM@3s: " + v); }
+                      });
+                    }
+                  }, 3000);
+                  webView.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                      webView.evaluateJavascript(DUMP_JS, new android.webkit.ValueCallback<String>() {
+                        @Override
+                        public void onReceiveValue(String v) { log("DOM@8s: " + v); }
+                      });
+                    }
+                  }, 8000);
+                }
               });
-              setContentView(webView);
+
+              setContentView(root);
               webView.loadUrl("https://appassets.androidplatform.net/");
             }
 

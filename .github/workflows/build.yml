@@ -46,21 +46,30 @@ jobs:
           npm install --legacy-peer-deps
           npm run build
 
-          DIST_DIR=""
-          for CANDIDATE in "dist" "build" ".output/public" "dist/client"; do
-            if [ -d "$CANDIDATE" ]; then
-              DIST_DIR="$CANDIDATE"
+          BUILD_ROOT=""
+          for CANDIDATE in "dist/client" ".output/public" "dist" "build"; do
+            if [ -f "$CANDIDATE/index.html" ]; then
+              BUILD_ROOT="$CANDIDATE"
               break
             fi
           done
 
-          if [ -z "$DIST_DIR" ]; then
-            echo "ERROR: Build output directory not found!"
+          if [ -z "$BUILD_ROOT" ]; then
+            BUILD_ROOT=$(find . -maxdepth 4 -name "index.html" -not -path "*/node_modules/*" | head -n 1 | xargs -r dirname)
+          fi
+
+          if [ -z "$BUILD_ROOT" ] || [ ! -f "$BUILD_ROOT/index.html" ]; then
+            echo "ERROR: index.html not found in build output!"
             exit 1
           fi
 
-          cp -r "$DIST_DIR"/* "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
+          echo "Using web build root: $BUILD_ROOT"
+          cp -r "$BUILD_ROOT"/* "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
+          rm -f "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/sw.js" "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/workbox-"*.js
+
+          echo "Final assets root contents:"
           ls -la "$GITHUB_WORKSPACE/offline-app/app/src/main/assets/"
+
 
       - name: Generate Dark Notes Signing Keystore
         run: |

@@ -21,17 +21,31 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      - name: Accept Android SDK Licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+      - name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Setup Android SDK 34
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null
 
       - name: Compile Dark Notes Web Bundle
         run: |
           mkdir -p web-src offline-app/app/src/main/assets
-          ZIP_FILE=$(ls -t *.zip 2>/dev/null | head -n 1)
+
+          if [ -f "Dark Notes Source.zip" ]; then
+            ZIP_FILE="Dark Notes Source.zip"
+          else
+            ZIP_FILE=$(ls -t *Dark*Notes*.zip *.zip 2>/dev/null | head -n 1)
+          fi
+          echo "Using ZIP: $ZIP_FILE"
           if [ -n "$ZIP_FILE" ]; then
             unzip -q "$ZIP_FILE" -d web-src
           else
-            cp -r ./* web-src/ 2>/dev/null || true
+            echo "ERROR: no ZIP found in repo root!"
+            exit 1
           fi
 
           PKG_PATH=$(find web-src -maxdepth 3 -name "package.json" | head -n 1)
@@ -43,44 +57,94 @@ jobs:
           APP_DIR=$(dirname "$PKG_PATH")
           echo "Building Dark Notes from: $APP_DIR"
           cd "$APP_DIR"
+
+          echo "===== package.json ====="
+          cat package.json || true
+          echo "===== vite config ====="
+          cat vite.config.* 2>/dev/null || true
+
           npm install --legacy-peer-deps
           npm run build
 
+          echo "===== build output ====="
+          ls -la .output .output/public .output/server dist dist/client 2>/dev/null || true
+
+          # Prerender "/" by running the built server and saving its HTML
+          SERVER_ENTRY=""
+          if [ -f ".output/server/index.mjs" ]; then
+            SERVER_ENTRY=".output/server/index.mjs"
+          fi
+          if [ -n "$SERVER_ENTRY" ]; then
+            echo "Starting built server to capture HTML..."
+            (PORT=3000 NITRO_PORT=3000 HOST=127.0.0.1 node "$SERVER_ENTRY" > "$GITHUB_WORKSPACE/server.log" 2>&1 &)
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:3000/ -o "$GITHUB_WORKSPACE/ssr-index.html" 2>/dev/null; then
+                echo "Captured SSR HTML on attempt $i"
+                break
+              fi
+              sleep 1
+            done
+            pkill -f "$SERVER_ENTRY" || true
+            echo "===== server.log (tail) ====="
+            tail -n 30 "$GITHUB_WORKSPACE/server.log" || true
+          else
+            echo "No .output/server/index.mjs found; will synthesize index.html"
+          fi
+
           export ASSETS_OUT="$GITHUB_WORKSPACE/offline-app/app/src/main/assets"
-          python3 - << 'PYEOF'
-          import os, shutil, glob, json
+          export SSR_HTML="$GITHUB_WORKSPACE/ssr-index.html"
+          cat > "$GITHUB_WORKSPACE/assemble.py" << 'PYEOF'
+          import os, shutil, glob, json, re
 
           assets_out = os.environ["ASSETS_OUT"]
+          ssr_html = os.environ["SSR_HTML"]
           os.makedirs(assets_out, exist_ok=True)
 
           copied = False
           for candidate in [".output/public", "dist/client", "dist", "build"]:
               if os.path.isdir(candidate):
-                  print(f"Copying build output from: {candidate}")
+                  print("Copying build output from:", candidate)
                   shutil.copytree(candidate, assets_out, dirs_exist_ok=True)
                   copied = True
-
           if not copied:
               raise SystemExit("ERROR: No web build output directory found!")
 
-          for pattern in ["sw.js", "workbox-*.js"]:
+          for pattern in ["sw.js", "workbox-*.js", "registerSW.js"]:
               for f in glob.glob(os.path.join(assets_out, pattern)):
                   os.remove(f)
 
-          index_path = os.path.join(assets_out, "index.html")
-          if not os.path.isfile(index_path):
-              print("Generating index.html for TanStack client bundle...")
-              css_files = []
-              entry_js = None
+          OVERLAY = """<script>
+          (function(){
+            function show(m){
+              var d=document.getElementById('__err');
+              if(!d){
+                d=document.createElement('pre');
+                d.id='__err';
+                d.style.cssText='position:fixed;left:0;right:0;bottom:0;max-height:50%;overflow:auto;margin:0;padding:8px;background:#300;color:#fff;font:11px monospace;z-index:2147483647;white-space:pre-wrap';
+                (document.body||document.documentElement).appendChild(d);
+              }
+              d.textContent+=m+'\\n';
+            }
+            window.addEventListener('error',function(e){show('ERR: '+e.message+' @'+(e.filename||'')+':'+e.lineno);});
+            window.addEventListener('unhandledrejection',function(e){show('REJ: '+((e.reason&&e.reason.stack)||e.reason));});
+          })();
+          </script>"""
 
-              manifest_candidates = [
-                  os.path.join(assets_out, ".vite", "manifest.json"),
-                  "dist/client/.vite/manifest.json",
-              ]
-              for mf in manifest_candidates:
+          index_path = os.path.join(assets_out, "index.html")
+          html = None
+
+          if os.path.isfile(index_path):
+              print("index.html already present in build output")
+              html = open(index_path, encoding="utf-8").read()
+          elif os.path.isfile(ssr_html) and "<script" in open(ssr_html, encoding="utf-8", errors="ignore").read():
+              print("Using prerendered SSR HTML as index.html")
+              html = open(ssr_html, encoding="utf-8", errors="ignore").read()
+          else:
+              print("Synthesizing index.html from client bundle...")
+              css_files, entry_js = [], None
+              for mf in [os.path.join(assets_out, ".vite", "manifest.json"), "dist/client/.vite/manifest.json"]:
                   if os.path.isfile(mf):
-                      with open(mf, "r", encoding="utf-8") as fp:
-                          manifest = json.load(fp)
+                      manifest = json.load(open(mf, encoding="utf-8"))
                       for item in manifest.values():
                           if item.get("isEntry"):
                               entry_js = item.get("file")
@@ -88,264 +152,285 @@ jobs:
                               break
                       if entry_js:
                           break
-
               assets_sub = os.path.join(assets_out, "assets")
               if os.path.isdir(assets_sub):
                   all_files = sorted(os.listdir(assets_sub))
                   if not css_files:
-                      css_files = [f"assets/{f}" for f in all_files if f.endswith(".css")]
+                      css_files = ["assets/" + f for f in all_files if f.endswith(".css")]
                   if not entry_js:
                       js_files = [f for f in all_files if f.endswith(".js")]
                       for prefix in ("main-", "client-", "entry-", "app-", "index-"):
-                          matches = [f for f in js_files if f.startswith(prefix)]
-                          if matches:
-                              entry_js = f"assets/{matches[0]}"
+                          m = [f for f in js_files if f.startswith(prefix)]
+                          if m:
+                              entry_js = "assets/" + m[0]
                               break
                       if not entry_js and js_files:
                           largest = max(js_files, key=lambda f: os.path.getsize(os.path.join(assets_sub, f)))
-                          entry_js = f"assets/{largest}"
-
-              css_tags = "\n    ".join(
-                  f'<link rel="stylesheet" href="./{c.lstrip("./")}" />' for c in dict.fromkeys(css_files)
+                          entry_js = "assets/" + largest
+              css_tags = "\n".join('<link rel="stylesheet" href="/%s" />' % c.lstrip("./") for c in dict.fromkeys(css_files))
+              js_tag = '<script type="module" src="/%s"></script>' % entry_js.lstrip("./") if entry_js else ""
+              html = (
+                  '<!doctype html><html lang="en" class="dark"><head><meta charset="UTF-8" />'
+                  '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />'
+                  '<title>Dark Notes</title>' + css_tags +
+                  '<style>html,body,#root,#app{margin:0;padding:0;width:100%;min-height:100%;background:#000;color:#fff}</style>'
+                  '</head><body><div id="root"></div><div id="app"></div>' + js_tag + '</body></html>'
               )
-              js_tag = (
-                  f'<script type="module" src="./{entry_js.lstrip("./")}"></script>'
-                  if entry_js else ""
-              )
+              print("entry_js =", entry_js, "css =", css_files)
 
-              html = f"""<!doctype html>
-          <html lang="en" class="dark">
-            <head>
-              <meta charset="UTF-8" />
-              <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-              <title>Dark Notes</title>
-              {css_tags}
-              <style>
-                html, body, #root, #app {{
-                  margin: 0;
-                  padding: 0;
-                  width: 100%;
-                  min-height: 100%;
-                  background: #000000;
-                  color: #ffffff;
-                }}
-              </style>
-            </head>
-            <body>
-              <div id="root"></div>
-              <div id="app"></div>
-              {js_tag}
-            </body>
-          </html>
-          """
-              with open(index_path, "w", encoding="utf-8") as fp:
-                  fp.write(html)
-              print(f"Generated index.html with entry_js={entry_js}, css={css_files}")
+          # strip service worker registration scripts
+          html = re.sub(r'<script[^>]*registerSW[^>]*>\s*</script>', '', html)
+          # inject on-screen error overlay at start of <head>
+          if re.search(r'<head[^>]*>', html):
+              html = re.sub(r'(<head[^>]*>)', lambda m: m.group(1) + OVERLAY, html, count=1)
+          else:
+              html = OVERLAY + html
+
+          with open(index_path, "w", encoding="utf-8") as fp:
+              fp.write(html)
+          print("Wrote index.html, bytes:", len(html))
           PYEOF
+          python3 "$GITHUB_WORKSPACE/assemble.py"
 
           echo "Final assets root contents:"
           ls -la "$ASSETS_OUT/"
-          ls -la "$ASSETS_OUT/assets/" 2>/dev/null || true
+          echo "===== index.html (first 3000 chars) ====="
+          head -c 3000 "$ASSETS_OUT/index.html"; echo
 
       - name: Create Dark Notes Offline Android Project
         run: |
+          cd "$GITHUB_WORKSPACE"
           mkdir -p offline-app/app/src/main/java/com/priyamrai/darknotes
           mkdir -p offline-app/app/src/main/res/values
           mkdir -p offline-app/app/src/main/res/xml
           mkdir -p offline-app/app/src/main/res/drawable
 
-          keytool -genkeypair -v \
-            -keystore offline-app/app/android.keystore \
-            -alias darknotes \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -storepass android123 \
-            -keypass android123 \
-            -dname "CN=Dark Notes, OU=App, O=Priyam Rai, L=Lucknow, S=UP, C=IN"
-
-          if [ -f offline-app/app/src/main/assets/icon-512.png ]; then
-            cp offline-app/app/src/main/assets/icon-512.png offline-app/app/src/main/res/drawable/ic_launcher.png
-          elif [ -f offline-app/app/src/main/assets/icon-192.png ]; then
-            cp offline-app/app/src/main/assets/icon-192.png offline-app/app/src/main/res/drawable/ic_launcher.png
+          if [ -f release-keystore/android.keystore ]; then
+            echo "Reusing keystore from repo"
+            cp release-keystore/android.keystore offline-app/app/android.keystore
           else
-            echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" | base64 -d > offline-app/app/src/main/res/drawable/ic_launcher.png
+            echo "Generating new keystore"
+            keytool -genkeypair -v \
+              -keystore offline-app/app/android.keystore \
+              -alias darknotes \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android123 \
+              -keypass android123 \
+              -dname "CN=Dark Notes, OU=App, O=Priyam Rai, L=Lucknow, ST=UP, C=IN"
           fi
 
-          printf '%s\n' \
-            'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8' \
-            'android.useAndroidX=true' \
-            'android.enableJetifier=true' > offline-app/gradle.properties
+          cat > "$GITHUB_WORKSPACE/icon.py" << 'PYEOF'
+          import struct, zlib
+          w, h = 192, 192
+          raw = bytearray()
+          for y in range(h):
+              raw.append(0)
+              for x in range(w):
+                  dx, dy = x - w // 2, y - h // 2
+                  if -36 <= dx <= 36 and -48 <= dy <= 48 and (abs(dx) > 28 or abs(dy) > 40 or (-20 <= dx <= 20 and dy in (-16, 0, 16))):
+                      raw.extend((235, 235, 235, 255))
+                  else:
+                      raw.extend((0, 0, 0, 255))
+          def chunk(tag, data):
+              return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", zlib.crc32(tag + data) & 0xffffffff)
+          png = (b"\x89PNG\r\n\x1a\n"
+                 + chunk(b"IHDR", struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                 + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+                 + chunk(b"IEND", b""))
+          open("offline-app/app/src/main/res/drawable/ic_launcher.png", "wb").write(png)
+          PYEOF
+          python3 "$GITHUB_WORKSPACE/icon.py"
 
-          printf '%s\n' \
-            'rootProject.name = "DarkNotesOffline"' \
-            "include ':app'" > offline-app/settings.gradle
+          cat > offline-app/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
 
-          printf '%s\n' \
-            'buildscript {' \
-            '  repositories {' \
-            '    google()' \
-            '    mavenCentral()' \
-            '  }' \
-            '  dependencies {' \
-            "    classpath 'com.android.tools.build:gradle:8.5.2'" \
-            '  }' \
-            '}' \
-            'allprojects {' \
-            '  repositories {' \
-            '    google()' \
-            '    mavenCentral()' \
-            '  }' \
-            '}' > offline-app/build.gradle
+          cat > offline-app/settings.gradle << 'EOF'
+          rootProject.name = "DarkNotesOffline"
+          include ':app'
+          EOF
 
-          printf '%s\n' \
-            'plugins {' \
-            "  id 'com.android.application'" \
-            '}' \
-            'android {' \
-            '  namespace "com.priyamrai.darknotes"' \
-            '  compileSdk 34' \
-            '  defaultConfig {' \
-            '    applicationId "com.priyamrai.darknotes"' \
-            '    minSdk 24' \
-            '    targetSdk 34' \
-            '    versionCode 1' \
-            '    versionName "1.0"' \
-            '  }' \
-            '  compileOptions {' \
-            '    sourceCompatibility JavaVersion.VERSION_17' \
-            '    targetCompatibility JavaVersion.VERSION_17' \
-            '  }' \
-            '  signingConfigs {' \
-            '    release {' \
-            '      storeFile file("android.keystore")' \
-            '      storePassword "android123"' \
-            '      keyAlias "darknotes"' \
-            '      keyPassword "android123"' \
-            '    }' \
-            '  }' \
-            '  buildTypes {' \
-            '    release {' \
-            '      signingConfig signingConfigs.release' \
-            '      minifyEnabled false' \
-            '      shrinkResources false' \
-            '    }' \
-            '  }' \
-            '}' \
-            'dependencies {' \
-            "  implementation 'androidx.appcompat:appcompat:1.7.0'" \
-            "  implementation 'androidx.webkit:webkit:1.11.0'" \
-            '}' > offline-app/app/build.gradle
+          cat > offline-app/build.gradle << 'EOF'
+          buildscript {
+            repositories {
+              google()
+              mavenCentral()
+            }
+            dependencies {
+              classpath 'com.android.tools.build:gradle:8.5.2'
+            }
+          }
+          allprojects {
+            repositories {
+              google()
+              mavenCentral()
+            }
+          }
+          EOF
 
-          printf '%s\n' \
-            '<resources>' \
-            '  <string name="app_name">Dark Notes</string>' \
-            '</resources>' > offline-app/app/src/main/res/values/strings.xml
+          cat > offline-app/app/build.gradle << 'EOF'
+          plugins {
+            id 'com.android.application'
+          }
+          android {
+            namespace "com.priyamrai.darknotes"
+            compileSdk 34
+            defaultConfig {
+              applicationId "com.priyamrai.darknotes"
+              minSdk 24
+              targetSdk 34
+              versionCode 1
+              versionName "1.0"
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+            lint {
+              checkReleaseBuilds false
+              abortOnError false
+            }
+            signingConfigs {
+              release {
+                storeFile file("android.keystore")
+                storePassword "android123"
+                keyAlias "darknotes"
+                keyPassword "android123"
+              }
+            }
+            buildTypes {
+              release {
+                signingConfig signingConfigs.release
+                minifyEnabled false
+                shrinkResources false
+              }
+            }
+          }
+          dependencies {
+            implementation 'androidx.appcompat:appcompat:1.6.1'
+            implementation 'androidx.webkit:webkit:1.10.0'
+          }
+          EOF
 
-          printf '%s\n' \
-            '<resources>' \
-            '  <style name="Theme.DarkNotes" parent="Theme.AppCompat.NoActionBar">' \
-            '    <item name="android:windowBackground">#000000</item>' \
-            '    <item name="android:statusBarColor">#000000</item>' \
-            '    <item name="android:navigationBarColor">#000000</item>' \
-            '  </style>' \
-            '</resources>' > offline-app/app/src/main/res/values/styles.xml
+          cat > offline-app/app/src/main/res/values/strings.xml << 'EOF'
+          <resources>
+            <string name="app_name">Dark Notes</string>
+          </resources>
+          EOF
 
-          printf '%s\n' \
-            '<?xml version="1.0" encoding="utf-8"?>' \
-            '<network-security-config>' \
-            '  <base-config cleartextTrafficPermitted="false" />' \
-            '</network-security-config>' > offline-app/app/src/main/res/xml/network_security_config.xml
+          cat > offline-app/app/src/main/res/values/styles.xml << 'EOF'
+          <resources>
+            <style name="Theme.DarkNotes" parent="Theme.AppCompat.NoActionBar">
+              <item name="android:windowBackground">#000000</item>
+              <item name="android:statusBarColor">#000000</item>
+              <item name="android:navigationBarColor">#000000</item>
+            </style>
+          </resources>
+          EOF
 
-          printf '%s\n' \
-            '<?xml version="1.0" encoding="utf-8"?>' \
-            '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
-            '  <application' \
-            '    android:label="@string/app_name"' \
-            '    android:icon="@drawable/ic_launcher"' \
-            '    android:theme="@style/Theme.DarkNotes"' \
-            '    android:networkSecurityConfig="@xml/network_security_config"' \
-            '    android:hardwareAccelerated="true"' \
-            '    android:allowBackup="true">' \
-            '    <activity' \
-            '      android:name=".MainActivity"' \
-            '      android:exported="true"' \
-            '      android:configChanges="orientation|screenSize|keyboardHidden">' \
-            '      <intent-filter>' \
-            '        <action android:name="android.intent.action.MAIN" />' \
-            '        <category android:name="android.intent.category.LAUNCHER" />' \
-            '      </intent-filter>' \
-            '    </activity>' \
-            '  </application>' \
-            '</manifest>' > offline-app/app/src/main/AndroidManifest.xml
+          cat > offline-app/app/src/main/res/xml/network_security_config.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <network-security-config>
+            <base-config cleartextTrafficPermitted="false" />
+          </network-security-config>
+          EOF
 
-          printf '%s\n' \
-            'package com.priyamrai.darknotes;' \
-            'import android.graphics.Color;' \
-            'import android.net.Uri;' \
-            'import android.os.Bundle;' \
-            'import android.view.ViewGroup;' \
-            'import android.webkit.WebChromeClient;' \
-            'import android.webkit.WebResourceRequest;' \
-            'import android.webkit.WebResourceResponse;' \
-            'import android.webkit.WebSettings;' \
-            'import android.webkit.WebView;' \
-            'import androidx.activity.OnBackPressedCallback;' \
-            'import androidx.appcompat.app.AppCompatActivity;' \
-            'import androidx.webkit.WebViewAssetLoader;' \
-            'import androidx.webkit.WebViewClientCompat;' \
-            'public class MainActivity extends AppCompatActivity {' \
-            '  private WebView webView;' \
-            '  @Override' \
-            '  protected void onCreate(Bundle savedInstanceState) {' \
-            '    super.onCreate(savedInstanceState);' \
-            '    webView = new WebView(this);' \
-            '    webView.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));' \
-            '    webView.setBackgroundColor(Color.BLACK);' \
-            '    WebSettings settings = webView.getSettings();' \
-            '    settings.setJavaScriptEnabled(true);' \
-            '    settings.setDomStorageEnabled(true);' \
-            '    settings.setDatabaseEnabled(true);' \
-            '    settings.setAllowFileAccess(false);' \
-            '    settings.setAllowContentAccess(false);' \
-            '    settings.setCacheMode(WebSettings.LOAD_NO_CACHE);' \
-            '    final WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder().addPathHandler("/", new WebViewAssetLoader.AssetsPathHandler(this)).build();' \
-            '    webView.setWebChromeClient(new WebChromeClient());' \
-            '    webView.setWebViewClient(new WebViewClientCompat() {' \
-            '      @Override' \
-            '      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {' \
-            '        Uri url = request.getUrl();' \
-            '        WebResourceResponse response = assetLoader.shouldInterceptRequest(url);' \
-            '        if (response == null && "appassets.androidplatform.net".equals(url.getHost())) {' \
-            '          String path = url.getPath();' \
-            '          if (path == null || !path.contains(".")) {' \
-            '            return assetLoader.shouldInterceptRequest(Uri.parse("https://appassets.androidplatform.net/index.html"));' \
-            '          }' \
-            '        }' \
-            '        return response;' \
-            '      }' \
-            '    });' \
-            '    getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {' \
-            '      @Override' \
-            '      public void handleOnBackPressed() {' \
-            '        if (webView != null && webView.canGoBack()) {' \
-            '          webView.goBack();' \
-            '        } else {' \
-            '          setEnabled(false);' \
-            '          getOnBackPressedDispatcher().onBackPressed();' \
-            '        }' \
-            '      }' \
-            '    });' \
-            '    setContentView(webView);' \
-            '    webView.loadUrl("https://appassets.androidplatform.net/");' \
-            '  }' \
-            '}' > offline-app/app/src/main/java/com/priyamrai/darknotes/MainActivity.java
+          cat > offline-app/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application
+              android:label="@string/app_name"
+              android:icon="@drawable/ic_launcher"
+              android:theme="@style/Theme.DarkNotes"
+              android:networkSecurityConfig="@xml/network_security_config"
+              android:hardwareAccelerated="true"
+              android:allowBackup="true">
+              <activity
+                android:name=".MainActivity"
+                android:exported="true"
+                android:configChanges="orientation|screenSize|keyboardHidden">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          cat > offline-app/app/src/main/java/com/priyamrai/darknotes/MainActivity.java << 'EOF'
+          package com.priyamrai.darknotes;
+
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.view.ViewGroup;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import androidx.appcompat.app.AppCompatActivity;
+          import androidx.webkit.WebViewAssetLoader;
+          import androidx.webkit.WebViewClientCompat;
+
+          public class MainActivity extends AppCompatActivity {
+            private WebView webView;
+
+            @Override
+            protected void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              webView = new WebView(this);
+              webView.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+              webView.setBackgroundColor(Color.BLACK);
+              WebSettings settings = webView.getSettings();
+              settings.setJavaScriptEnabled(true);
+              settings.setDomStorageEnabled(true);
+              settings.setDatabaseEnabled(true);
+              settings.setAllowFileAccess(false);
+              settings.setAllowContentAccess(false);
+              settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
+              final WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder()
+                  .addPathHandler("/", new WebViewAssetLoader.AssetsPathHandler(this))
+                  .build();
+              webView.setWebChromeClient(new WebChromeClient());
+              webView.setWebViewClient(new WebViewClientCompat() {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                  Uri url = request.getUrl();
+                  WebResourceResponse response = assetLoader.shouldInterceptRequest(url);
+                  if (response == null && "appassets.androidplatform.net".equals(url.getHost())) {
+                    String path = url.getPath();
+                    if (path == null || !path.contains(".")) {
+                      return assetLoader.shouldInterceptRequest(Uri.parse("https://appassets.androidplatform.net/index.html"));
+                    }
+                  }
+                  return response;
+                }
+              });
+              setContentView(webView);
+              webView.loadUrl("https://appassets.androidplatform.net/");
+            }
+
+            @Override
+            public void onBackPressed() {
+              if (webView != null && webView.canGoBack()) {
+                webView.goBack();
+              } else {
+                super.onBackPressed();
+              }
+            }
+          }
+          EOF
 
       - name: Compile Signed Dark Notes APK
         run: |
           cd offline-app
-          gradle wrapper --gradle-version 8.7 --no-daemon
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          gradle assembleRelease --no-daemon --stacktrace
 
       - name: Package Dark Notes APK & Keystore
         run: |

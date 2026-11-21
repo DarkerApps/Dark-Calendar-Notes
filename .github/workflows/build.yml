@@ -253,7 +253,7 @@ jobs:
       - name: Compile Signed Dark Notes APK
         run: |
           cd offline-app
-          gradle assembleRelease --no-daemon
+          gradle assembleRelease --no-daemon --stacktrace
 
       - name: Package Dark Notes APK & Keystore
         run: |

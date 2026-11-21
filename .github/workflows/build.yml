@@ -38,8 +38,6 @@ jobs:
         run: |
           mkdir -p web-src offline-app/app/src/main/assets
           export ASSETS_OUT="$GITHUB_WORKSPACE/offline-app/app/src/main/assets"
-          export DIAG="$GITHUB_WORKSPACE/diag.txt"
-          : > "$DIAG"
 
           ZIP_FILE=""
           for z in ./*.zip; do
@@ -50,7 +48,6 @@ jobs:
           done
           if [ -z "$ZIP_FILE" ]; then
             echo "ERROR: no zip with BUILD_TARGET=apk support found in repo root."
-            echo "Upload the NEW dark-notes-source.zip to the repo root."
             ls -la
             exit 1
           fi
@@ -71,96 +68,24 @@ jobs:
           export BUILD_TARGET=apk
           ./node_modules/.bin/vite build
 
-          echo "===== dist/client ====="
-          ls -la dist dist/client 2>&1 | head -40
+          ls -la dist/client
           if [ ! -f dist/client/index.html ]; then
             echo "ERROR: dist/client/index.html missing - BUILD_TARGET=apk build did not produce a static page."
             exit 1
           fi
 
-          cat > "$GITHUB_WORKSPACE/assemble.py" << 'PYEOF'
-          import os, shutil, glob, re
-
-          assets_out = os.environ["ASSETS_OUT"]
-          diag = os.environ["DIAG"]
-          os.makedirs(assets_out, exist_ok=True)
-          shutil.copytree("dist/client", assets_out, dirs_exist_ok=True)
-
-          for pattern in ["sw.js", "workbox-*.js", "registerSW.js", "_headers", "_redirects"]:
-              for f in glob.glob(os.path.join(assets_out, pattern)):
-                  os.remove(f)
-
-          OVERLAY = """<script>
-          (function(){
-            function show(m){
-              var d=document.getElementById('__err');
-              if(!d){
-                d=document.createElement('pre');
-                d.id='__err';
-                d.style.cssText='position:fixed;left:0;right:0;top:0;max-height:30%;overflow:auto;margin:0;padding:8px;background:#300;color:#fff;font:11px monospace;z-index:2147483647;white-space:pre-wrap';
-                (document.body||document.documentElement).appendChild(d);
-              }
-              d.textContent+=m+'\\n';
-            }
-            window.addEventListener('error',function(e){show('ERR: '+e.message+' @'+(e.filename||'')+':'+e.lineno);});
-            window.addEventListener('unhandledrejection',function(e){show('REJ: '+((e.reason&&e.reason.stack)||e.reason));});
-          })();
-          </script>"""
-
-          index_path = os.path.join(assets_out, "index.html")
-          html = open(index_path, encoding="utf-8").read()
-          html = re.sub(r'<script[^>]*registerSW[^>]*>\s*</script>', '', html)
-          if re.search(r'<head[^>]*>', html):
-              html = re.sub(r'(<head[^>]*>)', lambda m: m.group(1) + OVERLAY, html, count=1)
-          else:
-              html = OVERLAY + html
-          with open(index_path, "w", encoding="utf-8") as fp:
-              fp.write(html)
-
-          assets_sub = os.path.join(assets_out, "assets")
-          listing = sorted(os.listdir(assets_sub))[:40] if os.path.isdir(assets_sub) else []
-          with open(diag, "a", encoding="utf-8") as d:
-              d.write("== index.html bytes: %d ==\n" % len(html))
-              d.write("== assets/ files ==\n" + "\n".join(listing) + "\n")
-              d.write("== script tags ==\n" + "\n".join(re.findall(r'<script[^>]*>', html)) + "\n")
-          print("index.html ready, bytes =", len(html))
-          PYEOF
-          python3 "$GITHUB_WORKSPACE/assemble.py"
-
-          {
-            echo "== index.html (last 1500 chars) =="
-            tail -c 1500 "$ASSETS_OUT/index.html"
-            echo
-            echo "== assets root =="
-            ls "$ASSETS_OUT"
-          } >> "$DIAG"
-          cp "$DIAG" "$ASSETS_OUT/diag.txt"
-          cat "$DIAG"
+          cp -r dist/client/. "$ASSETS_OUT/"
+          rm -f "$ASSETS_OUT"/sw.js "$ASSETS_OUT"/workbox-*.js "$ASSETS_OUT"/registerSW.js "$ASSETS_OUT"/_headers "$ASSETS_OUT"/_redirects
+          echo "Assets root:"
+          ls "$ASSETS_OUT"
 
       - name: Create Dark Notes Offline Android Project
         run: |
           cd "$GITHUB_WORKSPACE"
-          mkdir -p offline-app/app/src/main/assets
           mkdir -p offline-app/app/src/main/java/com/priyamrai/darknotes
           mkdir -p offline-app/app/src/main/res/values
           mkdir -p offline-app/app/src/main/res/xml
           mkdir -p offline-app/app/src/main/res/drawable
-
-          cat > offline-app/app/src/main/assets/test.html << 'EOF'
-          <!doctype html>
-          <html>
-            <head>
-              <meta charset="UTF-8" />
-              <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-              <title>Test</title>
-            </head>
-            <body style="background:#222;color:#0f0;font:20px monospace;padding:16px">
-              <h1>WebView OK</h1>
-              <p id="js">JS not running</p>
-              <script>document.getElementById('js').textContent = 'JS OK';</script>
-            </body>
-          </html>
-          EOF
 
           if [ -f release-keystore/android.keystore ]; then
             echo "Reusing keystore from repo"
@@ -240,8 +165,8 @@ jobs:
               applicationId "com.priyamrai.darknotes"
               minSdk 24
               targetSdk 34
-              versionCode 5
-              versionName "1.4-debug"
+              versionCode 6
+              versionName "1.0"
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -323,145 +248,33 @@ jobs:
           cat > offline-app/app/src/main/java/com/priyamrai/darknotes/MainActivity.java << 'EOF'
           package com.priyamrai.darknotes;
 
-          import android.graphics.Bitmap;
           import android.graphics.Color;
           import android.net.Uri;
           import android.os.Bundle;
-          import android.text.method.ScrollingMovementMethod;
-          import android.view.Gravity;
-          import android.view.KeyEvent;
-          import android.view.View;
           import android.view.ViewGroup;
-          import android.webkit.ConsoleMessage;
           import android.webkit.WebChromeClient;
           import android.webkit.WebResourceRequest;
           import android.webkit.WebResourceResponse;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
-          import android.widget.FrameLayout;
-          import android.widget.TextView;
           import androidx.appcompat.app.AppCompatActivity;
           import androidx.webkit.WebViewAssetLoader;
           import androidx.webkit.WebViewClientCompat;
           import java.io.ByteArrayInputStream;
-          import java.io.ByteArrayOutputStream;
-          import java.io.InputStream;
           import java.util.HashMap;
 
           public class MainActivity extends AppCompatActivity {
             private static final String HOST = "appassets.androidplatform.net";
             private static final String BASE = "https://" + HOST;
             private WebView webView;
-            private TextView dbg;
-            private boolean showDiag = false;
-            private String diagText = "";
-            private final StringBuilder logBuf = new StringBuilder();
-
-            private static final String DUMP_JS =
-              "(function(){var r=document.getElementById('root');"
-              + "return 'bodyLen='+document.body.innerHTML.length+' rootLen='+(r?r.innerHTML.length:'none')"
-              + "+' scripts='+document.scripts.length+' text='+document.body.innerText.slice(0,200);})()";
-
-            private void log(final String s) {
-              runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                  logBuf.insert(0, s + "\n");
-                  if (logBuf.length() > 12000) logBuf.setLength(12000);
-                  if (dbg != null && !showDiag) dbg.setText(logBuf.toString());
-                }
-              });
-            }
-
-            private String readAsset(String name) {
-              try {
-                InputStream is = getAssets().open(name);
-                ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
-                is.close();
-                return bos.toString("UTF-8");
-              } catch (Exception e) {
-                return "READ FAILED " + name + ": " + e;
-              }
-            }
-
-            private void showPanel() {
-              runOnUiThread(new Runnable() {
-                @Override
-                public void run() { dbg.setVisibility(View.VISIBLE); }
-              });
-            }
-
-            private void checkBlank(final String label) {
-              webView.evaluateJavascript("document.body?document.body.innerText.length:-1",
-                  new android.webkit.ValueCallback<String>() {
-                    @Override
-                    public void onReceiveValue(String v) {
-                      log(label + " textLen=" + v);
-                      try {
-                        int n = Integer.parseInt(v.trim());
-                        if (n < 20) showPanel();
-                      } catch (Exception e) {
-                        showPanel();
-                      }
-                    }
-                  });
-            }
-
-            @Override
-            public boolean onKeyDown(int keyCode, KeyEvent event) {
-              if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
-                dbg.setVisibility(dbg.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
-                return true;
-              }
-              return super.onKeyDown(keyCode, event);
-            }
 
             @Override
             protected void onCreate(Bundle savedInstanceState) {
               super.onCreate(savedInstanceState);
 
-              FrameLayout root = new FrameLayout(this);
               webView = new WebView(this);
-              webView.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+              webView.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
               webView.setBackgroundColor(Color.BLACK);
-              root.addView(webView);
-
-              dbg = new TextView(this);
-              dbg.setTextColor(0xFF00FF66);
-              dbg.setBackgroundColor(0xEE111111);
-              dbg.setTextSize(10);
-              dbg.setTypeface(android.graphics.Typeface.MONOSPACE);
-              dbg.setMovementMethod(new ScrollingMovementMethod());
-              dbg.setPadding(8, 8, 8, 8);
-              dbg.setVisibility(View.GONE);
-              int h = (int) (getResources().getDisplayMetrics().heightPixels * 0.50f);
-              FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, h);
-              lp.gravity = Gravity.BOTTOM;
-              root.addView(dbg, lp);
-
-              diagText = readAsset("diag.txt");
-
-              dbg.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                  showDiag = !showDiag;
-                  dbg.setText(showDiag ? ("BUILD REPORT (tap = back to log)\n" + diagText) : logBuf.toString());
-                  dbg.scrollTo(0, 0);
-                }
-              });
-              dbg.setOnLongClickListener(new View.OnLongClickListener() {
-                @Override
-                public boolean onLongClick(View v) {
-                  log("LOADING test.html");
-                  webView.loadUrl(BASE + "/test.html");
-                  return true;
-                }
-              });
-
-              log("Dark Notes debug build 5 (Volume Up = toggle panel, tap = build report, long-press = test.html)");
 
               WebSettings settings = webView.getSettings();
               settings.setJavaScriptEnabled(true);
@@ -475,14 +288,7 @@ jobs:
                   .addPathHandler("/", new WebViewAssetLoader.AssetsPathHandler(this))
                   .build();
 
-              webView.setWebChromeClient(new WebChromeClient() {
-                @Override
-                public boolean onConsoleMessage(ConsoleMessage cm) {
-                  log("JS " + cm.messageLevel() + ": " + cm.message() + " @" + cm.sourceId() + ":" + cm.lineNumber());
-                  return true;
-                }
-              });
-
+              webView.setWebChromeClient(new WebChromeClient());
               webView.setWebViewClient(new WebViewClientCompat() {
                 @Override
                 public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
@@ -491,52 +297,17 @@ jobs:
                     String path = url.getPath();
                     if (path == null || path.isEmpty() || path.equals("/") || !path.contains(".")) {
                       if (path != null && (path.startsWith("/_") || path.startsWith("/api/"))) {
-                        log("BLOCKED " + path);
                         return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
                             new HashMap<String, String>(), new ByteArrayInputStream(new byte[0]));
                       }
-                      log("REQ " + path + " -> index.html");
                       return assetLoader.shouldInterceptRequest(Uri.parse(BASE + "/index.html"));
                     }
-                    log("REQ " + path);
                   }
                   return assetLoader.shouldInterceptRequest(url);
                 }
-
-                @Override
-                public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                  log("page started: " + url);
-                }
-
-                @Override
-                public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
-                  log("HTTP ERR " + errorResponse.getStatusCode() + " " + request.getUrl());
-                }
-
-                @Override
-                public void onPageFinished(WebView view, String url) {
-                  log("page finished: " + url);
-                  webView.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                      webView.evaluateJavascript(DUMP_JS, new android.webkit.ValueCallback<String>() {
-                        @Override
-                        public void onReceiveValue(String v) { log("DOM@3s: " + v); }
-                      });
-                    }
-                  }, 3000);
-                  webView.postDelayed(new Runnable() {
-                    @Override
-                    public void run() { checkBlank("blank-check@4s"); }
-                  }, 4000);
-                  webView.postDelayed(new Runnable() {
-                    @Override
-                    public void run() { checkBlank("blank-check@9s"); }
-                  }, 9000);
-                }
               });
 
-              setContentView(root);
+              setContentView(webView);
               webView.loadUrl(BASE + "/");
             }
 

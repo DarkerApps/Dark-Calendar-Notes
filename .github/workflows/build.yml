@@ -201,10 +201,27 @@ jobs:
       - name: Create Dark Notes Offline Android Project
         run: |
           cd "$GITHUB_WORKSPACE"
+          mkdir -p offline-app/app/src/main/assets
           mkdir -p offline-app/app/src/main/java/com/priyamrai/darknotes
           mkdir -p offline-app/app/src/main/res/values
           mkdir -p offline-app/app/src/main/res/xml
           mkdir -p offline-app/app/src/main/res/drawable
+
+          cat > offline-app/app/src/main/assets/test.html << 'EOF'
+          <!doctype html>
+          <html>
+            <head>
+              <meta charset="UTF-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+              <title>Test</title>
+            </head>
+            <body style="background:#222;color:#0f0;font:20px monospace;padding:16px">
+              <h1>WebView OK</h1>
+              <p id="js">JS not running</p>
+              <script>document.getElementById('js').textContent = 'JS OK';</script>
+            </body>
+          </html>
+          EOF
 
           if [ -f release-keystore/android.keystore ]; then
             echo "Reusing keystore from repo"
@@ -284,8 +301,8 @@ jobs:
               applicationId "com.priyamrai.darknotes"
               minSdk 24
               targetSdk 34
-              versionCode 2
-              versionName "1.1-debug"
+              versionCode 3
+              versionName "1.2-debug"
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -366,6 +383,7 @@ jobs:
           cat > offline-app/app/src/main/java/com/priyamrai/darknotes/MainActivity.java << 'EOF'
           package com.priyamrai.darknotes;
 
+          import android.graphics.Bitmap;
           import android.graphics.Color;
           import android.net.Uri;
           import android.os.Bundle;
@@ -383,8 +401,11 @@ jobs:
           import androidx.appcompat.app.AppCompatActivity;
           import androidx.webkit.WebViewAssetLoader;
           import androidx.webkit.WebViewClientCompat;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
 
           public class MainActivity extends AppCompatActivity {
+            private static final String BASE = "https://appassets.androidplatform.net";
             private WebView webView;
             private TextView dbg;
             private final StringBuilder logBuf = new StringBuilder();
@@ -401,10 +422,56 @@ jobs:
                 @Override
                 public void run() {
                   logBuf.insert(0, s + "\n");
-                  if (logBuf.length() > 6000) logBuf.setLength(6000);
+                  if (logBuf.length() > 12000) logBuf.setLength(12000);
                   if (dbg != null) dbg.setText(logBuf.toString());
                 }
               });
+            }
+
+            private static int count(String s, String needle) {
+              int c = 0, i = 0;
+              while ((i = s.indexOf(needle, i)) >= 0) { c++; i += needle.length(); }
+              return c;
+            }
+
+            private void summarize() {
+              try {
+                InputStream is = getAssets().open("index.html");
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
+                is.close();
+                String s = bos.toString("UTF-8");
+                log("index.html bytes=" + s.length() + " scripts=" + count(s, "<script")
+                    + " video=" + count(s, "<video") + " img=" + count(s, "<img")
+                    + " tsr=" + s.contains("$_TSR"));
+              } catch (Exception e) {
+                log("index.html read FAILED: " + e);
+              }
+              try {
+                String[] top = getAssets().list("");
+                log("assets root: " + java.util.Arrays.toString(top));
+                String[] a = getAssets().list("assets");
+                log("assets/assets count: " + (a == null ? -1 : a.length));
+              } catch (Exception e) {
+                log("assets list FAILED: " + e);
+              }
+            }
+
+            private void heartbeat(final int n) {
+              webView.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                  log("HB" + n + " progress=" + webView.getProgress() + " url=" + webView.getUrl());
+                  webView.evaluateJavascript("document.readyState+'|'+document.body.innerHTML.length",
+                      new android.webkit.ValueCallback<String>() {
+                        @Override
+                        public void onReceiveValue(String v) { log("HB" + n + " js=" + v); }
+                      });
+                  if (n < 5) heartbeat(n + 1);
+                }
+              }, 2000);
             }
 
             @Override
@@ -424,12 +491,22 @@ jobs:
               dbg.setTypeface(android.graphics.Typeface.MONOSPACE);
               dbg.setMovementMethod(new ScrollingMovementMethod());
               dbg.setPadding(8, 8, 8, 8);
-              int h = (int) (getResources().getDisplayMetrics().heightPixels * 0.40f);
+              int h = (int) (getResources().getDisplayMetrics().heightPixels * 0.55f);
               FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, h);
               lp.gravity = Gravity.BOTTOM;
               root.addView(dbg, lp);
 
-              log("Dark Notes debug build 2");
+              dbg.setOnLongClickListener(new android.view.View.OnLongClickListener() {
+                @Override
+                public boolean onLongClick(android.view.View v) {
+                  log("LOADING test.html");
+                  webView.loadUrl(BASE + "/test.html");
+                  return true;
+                }
+              });
+
+              log("Dark Notes debug build 3 (long-press panel = load test.html)");
+              summarize();
 
               WebSettings settings = webView.getSettings();
               settings.setJavaScriptEnabled(true);
@@ -449,6 +526,11 @@ jobs:
                   log("JS " + cm.messageLevel() + ": " + cm.message() + " @" + cm.sourceId() + ":" + cm.lineNumber());
                   return true;
                 }
+
+                @Override
+                public void onProgressChanged(WebView view, int p) {
+                  if (p % 25 == 0 || p == 100) log("progress " + p);
+                }
               });
 
               webView.setWebViewClient(new WebViewClientCompat() {
@@ -459,13 +541,24 @@ jobs:
                   if (response == null && "appassets.androidplatform.net".equals(url.getHost())) {
                     String path = url.getPath();
                     if (path == null || !path.contains(".")) {
-                      return assetLoader.shouldInterceptRequest(Uri.parse("https://appassets.androidplatform.net/index.html"));
+                      log("REQ " + path + " -> index fallback");
+                      return assetLoader.shouldInterceptRequest(Uri.parse(BASE + "/index.html"));
                     }
-                    log("MISSING: " + path);
-                  } else if (response == null) {
-                    log("EXTERNAL: " + url);
+                    log("MISSING " + path);
+                    return null;
                   }
+                  log("REQ " + url.getPath() + " -> " + (response == null ? "null(" + url.getHost() + ")" : "ok"));
                   return response;
+                }
+
+                @Override
+                public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                  log("page started: " + url);
+                }
+
+                @Override
+                public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
+                  log("HTTP ERR " + errorResponse.getStatusCode() + " " + request.getUrl());
                 }
 
                 @Override
@@ -480,20 +573,12 @@ jobs:
                       });
                     }
                   }, 3000);
-                  webView.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                      webView.evaluateJavascript(DUMP_JS, new android.webkit.ValueCallback<String>() {
-                        @Override
-                        public void onReceiveValue(String v) { log("DOM@8s: " + v); }
-                      });
-                    }
-                  }, 8000);
                 }
               });
 
               setContentView(root);
-              webView.loadUrl("https://appassets.androidplatform.net/");
+              webView.loadUrl(BASE + "/");
+              heartbeat(1);
             }
 
             @Override

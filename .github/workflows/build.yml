@@ -46,68 +46,136 @@ jobs:
           npm install --legacy-peer-deps
           npm run build
 
-          ASSETS_OUT="$GITHUB_WORKSPACE/offline-app/app/src/main/assets"
-          COPIED=0
+          export ASSETS_OUT="$GITHUB_WORKSPACE/offline-app/app/src/main/assets"
+          python3 - << 'PYEOF'
+          import os, shutil, glob, json
 
-          for CANDIDATE in "dist/client" ".output/public" "dist" "build"; do
-            if [ -d "$CANDIDATE" ]; then
-              echo "Copying build output from: $CANDIDATE"
-              cp -r "$CANDIDATE"/* "$ASSETS_OUT/" 2>/dev/null || true
-              COPIED=1
-              if [ -f "$CANDIDATE/index.html" ]; then
-                cp -f "$CANDIDATE/index.html" "$ASSETS_OUT/index.html"
-              fi
-              break
-            fi
-          done
+          assets_out = os.environ["ASSETS_OUT"]
+          os.makedirs(assets_out, exist_ok=True)
 
-          if [ "$COPIED" -eq 0 ]; then
-            FOUND_HTML=$(find . -maxdepth 4 -name "index.html" -not -path "*/node_modules/*" | head -n 1)
-            if [ -n "$FOUND_HTML" ]; then
-              FOUND_DIR=$(dirname "$FOUND_HTML")
-              cp -r "$FOUND_DIR"/* "$ASSETS_OUT/" 2>/dev/null || true
-              COPIED=1
-            fi
-          fi
+          copied = False
+          for candidate in [".output/public", "dist/client", "dist", "build"]:
+              if os.path.isdir(candidate):
+                  print(f"Copying build output from: {candidate}")
+                  shutil.copytree(candidate, assets_out, dirs_exist_ok=True)
+                  copied = True
 
-          if [ "$COPIED" -eq 0 ]; then
-            echo "ERROR: No web build output directory found!"
-            exit 1
-          fi
+          if not copied:
+              raise SystemExit("ERROR: No web build output directory found!")
 
-          rm -f "$ASSETS_OUT/sw.js" "$ASSETS_OUT/workbox-"*.js
+          for pattern in ["sw.js", "workbox-*.js"]:
+              for f in glob.glob(os.path.join(assets_out, pattern)):
+                  os.remove(f)
 
-          if [ ! -f "$ASSETS_OUT/index.html" ]; then
-            echo "Creating fallback index.html for offline WebViewAssetLoader..."
-            printf '%s\n' \
-              '<!doctype html>' \
-              '<html lang="en" class="dark">' \
-              '<head>' \
-              '<meta charset="UTF-8" />' \
-              '<meta name="viewport" content="width=device-width, initial-scale=1.0" />' \
-              '<title>Dark Notes</title>' \
-              '<style>html,body,#root,#app{margin:0;padding:0;width:100%;height:100%;background:#000000;color:#ffffff;}</style>' \
-              '</head>' \
-              '<body>' \
-              '<div id="root"></div>' \
-              '<div id="app"></div>' \
-              '<script type="module">import("./assets/main.js").catch(() => {});</script>' \
-              '</body>' \
-              '</html>' > "$ASSETS_OUT/index.html"
-          fi
+          index_path = os.path.join(assets_out, "index.html")
+          if not os.path.isfile(index_path):
+              print("Generating index.html for TanStack client bundle...")
+              css_files = []
+              entry_js = None
+
+              manifest_candidates = [
+                  os.path.join(assets_out, ".vite", "manifest.json"),
+                  "dist/client/.vite/manifest.json",
+              ]
+              for mf in manifest_candidates:
+                  if os.path.isfile(mf):
+                      with open(mf, "r", encoding="utf-8") as fp:
+                          manifest = json.load(fp)
+                      for item in manifest.values():
+                          if item.get("isEntry"):
+                              entry_js = item.get("file")
+                              css_files.extend(item.get("css", []))
+                              break
+                      if entry_js:
+                          break
+
+              assets_sub = os.path.join(assets_out, "assets")
+              if os.path.isdir(assets_sub):
+                  all_files = sorted(os.listdir(assets_sub))
+                  if not css_files:
+                      css_files = [f"assets/{f}" for f in all_files if f.endswith(".css")]
+                  if not entry_js:
+                      js_files = [f for f in all_files if f.endswith(".js")]
+                      for prefix in ("main-", "client-", "entry-", "app-", "index-"):
+                          matches = [f for f in js_files if f.startswith(prefix)]
+                          if matches:
+                              entry_js = f"assets/{matches[0]}"
+                              break
+                      if not entry_js and js_files:
+                          largest = max(js_files, key=lambda f: os.path.getsize(os.path.join(assets_sub, f)))
+                          entry_js = f"assets/{largest}"
+
+              css_tags = "\n    ".join(
+                  f'<link rel="stylesheet" href="./{c.lstrip("./")}" />' for c in dict.fromkeys(css_files)
+              )
+              js_tag = (
+                  f'<script type="module" src="./{entry_js.lstrip("./")}"></script>'
+                  if entry_js else ""
+              )
+
+              html = f"""<!doctype html>
+          <html lang="en" class="dark">
+            <head>
+              <meta charset="UTF-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+              <title>Dark Notes</title>
+              {css_tags}
+              <style>
+                html, body, #root, #app {{
+                  margin: 0;
+                  padding: 0;
+                  width: 100%;
+                  min-height: 100%;
+                  background: #000000;
+                  color: #ffffff;
+                }}
+              </style>
+            </head>
+            <body>
+              <div id="root"></div>
+              <div id="app"></div>
+              {js_tag}
+            </body>
+          </html>
+          """
+              with open(index_path, "w", encoding="utf-8") as fp:
+                  fp.write(html)
+              print(f"Generated index.html with entry_js={entry_js}, css={css_files}")
+          PYEOF
 
           echo "Final assets root contents:"
           ls -la "$ASSETS_OUT/"
-
-      - name: Generate Dark Notes Signing Keystore
-        run: |
-          keytool -genkeypair -v -keystore android.keystore -alias darknotes -keyalg RSA -keysize 2048 -validity 10000 -storepass android123 -keypass android123 -dname "CN=Dark Notes, OU=App, O=Priyam Rai, L=Lucknow, S=UP, C=IN"
+          ls -la "$ASSETS_OUT/assets/" 2>/dev/null || true
 
       - name: Create Dark Notes Offline Android Project
         run: |
           mkdir -p offline-app/app/src/main/java/com/priyamrai/darknotes
           mkdir -p offline-app/app/src/main/res/values
           mkdir -p offline-app/app/src/main/res/xml
+          mkdir -p offline-app/app/src/main/res/drawable
+
+          keytool -genkeypair -v \
+            -keystore offline-app/app/android.keystore \
+            -alias darknotes \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass android123 \
+            -keypass android123 \
+            -dname "CN=Dark Notes, OU=App, O=Priyam Rai, L=Lucknow, S=UP, C=IN"
+
+          if [ -f offline-app/app/src/main/assets/icon-512.png ]; then
+            cp offline-app/app/src/main/assets/icon-512.png offline-app/app/src/main/res/drawable/ic_launcher.png
+          elif [ -f offline-app/app/src/main/assets/icon-192.png ]; then
+            cp offline-app/app/src/main/assets/icon-192.png offline-app/app/src/main/res/drawable/ic_launcher.png
+          else
+            echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" | base64 -d > offline-app/app/src/main/res/drawable/ic_launcher.png
+          fi
+
+          printf '%s\n' \
+            'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8' \
+            'android.useAndroidX=true' \
+            'android.enableJetifier=true' > offline-app/gradle.properties
 
           printf '%s\n' \
             'rootProject.name = "DarkNotesOffline"' \
@@ -120,7 +188,7 @@ jobs:
             '    mavenCentral()' \
             '  }' \
             '  dependencies {' \
-            "    classpath 'com.android.tools.build:gradle:8.2.2'" \
+            "    classpath 'com.android.tools.build:gradle:8.5.2'" \
             '  }' \
             '}' \
             'allprojects {' \
@@ -128,8 +196,7 @@ jobs:
             '    google()' \
             '    mavenCentral()' \
             '  }' \
-            '}' \
-            "task clean(type: Delete) { delete rootProject.buildDir }" > offline-app/build.gradle
+            '}' > offline-app/build.gradle
 
           printf '%s\n' \
             'plugins {' \
@@ -145,9 +212,13 @@ jobs:
             '    versionCode 1' \
             '    versionName "1.0"' \
             '  }' \
+            '  compileOptions {' \
+            '    sourceCompatibility JavaVersion.VERSION_17' \
+            '    targetCompatibility JavaVersion.VERSION_17' \
+            '  }' \
             '  signingConfigs {' \
             '    release {' \
-            '      storeFile file("../../android.keystore")' \
+            '      storeFile file("android.keystore")' \
             '      storePassword "android123"' \
             '      keyAlias "darknotes"' \
             '      keyPassword "android123"' \
@@ -162,8 +233,8 @@ jobs:
             '  }' \
             '}' \
             'dependencies {' \
-            "  implementation 'androidx.appcompat:appcompat:1.6.1'" \
-            "  implementation 'androidx.webkit:webkit:1.10.0'" \
+            "  implementation 'androidx.appcompat:appcompat:1.7.0'" \
+            "  implementation 'androidx.webkit:webkit:1.11.0'" \
             '}' > offline-app/app/build.gradle
 
           printf '%s\n' \
@@ -191,6 +262,7 @@ jobs:
             '<manifest xmlns:android="http://schemas.android.com/apk/res/android">' \
             '  <application' \
             '    android:label="@string/app_name"' \
+            '    android:icon="@drawable/ic_launcher"' \
             '    android:theme="@style/Theme.DarkNotes"' \
             '    android:networkSecurityConfig="@xml/network_security_config"' \
             '    android:hardwareAccelerated="true"' \
@@ -210,12 +282,15 @@ jobs:
           printf '%s\n' \
             'package com.priyamrai.darknotes;' \
             'import android.graphics.Color;' \
+            'import android.net.Uri;' \
             'import android.os.Bundle;' \
             'import android.view.ViewGroup;' \
+            'import android.webkit.WebChromeClient;' \
             'import android.webkit.WebResourceRequest;' \
             'import android.webkit.WebResourceResponse;' \
             'import android.webkit.WebSettings;' \
             'import android.webkit.WebView;' \
+            'import androidx.activity.OnBackPressedCallback;' \
             'import androidx.appcompat.app.AppCompatActivity;' \
             'import androidx.webkit.WebViewAssetLoader;' \
             'import androidx.webkit.WebViewClientCompat;' \
@@ -235,31 +310,48 @@ jobs:
             '    settings.setAllowContentAccess(false);' \
             '    settings.setCacheMode(WebSettings.LOAD_NO_CACHE);' \
             '    final WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder().addPathHandler("/", new WebViewAssetLoader.AssetsPathHandler(this)).build();' \
+            '    webView.setWebChromeClient(new WebChromeClient());' \
             '    webView.setWebViewClient(new WebViewClientCompat() {' \
             '      @Override' \
             '      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {' \
-            '        return assetLoader.shouldInterceptRequest(request.getUrl());' \
+            '        Uri url = request.getUrl();' \
+            '        WebResourceResponse response = assetLoader.shouldInterceptRequest(url);' \
+            '        if (response == null && "appassets.androidplatform.net".equals(url.getHost())) {' \
+            '          String path = url.getPath();' \
+            '          if (path == null || !path.contains(".")) {' \
+            '            return assetLoader.shouldInterceptRequest(Uri.parse("https://appassets.androidplatform.net/index.html"));' \
+            '          }' \
+            '        }' \
+            '        return response;' \
+            '      }' \
+            '    });' \
+            '    getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {' \
+            '      @Override' \
+            '      public void handleOnBackPressed() {' \
+            '        if (webView != null && webView.canGoBack()) {' \
+            '          webView.goBack();' \
+            '        } else {' \
+            '          setEnabled(false);' \
+            '          getOnBackPressedDispatcher().onBackPressed();' \
+            '        }' \
             '      }' \
             '    });' \
             '    setContentView(webView);' \
-            '    webView.loadUrl("https://appassets.androidplatform.net/index.html");' \
-            '  }' \
-            '  @Override' \
-            '  public void onBackPressed() {' \
-            '    if (webView != null && webView.canGoBack()) { webView.goBack(); } else { super.onBackPressed(); }' \
+            '    webView.loadUrl("https://appassets.androidplatform.net/");' \
             '  }' \
             '}' > offline-app/app/src/main/java/com/priyamrai/darknotes/MainActivity.java
 
       - name: Compile Signed Dark Notes APK
         run: |
           cd offline-app
-          gradle assembleRelease --no-daemon --stacktrace
+          gradle wrapper --gradle-version 8.7 --no-daemon
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Package Dark Notes APK & Keystore
         run: |
           mkdir -p release-bundle
           cp offline-app/app/build/outputs/apk/release/app-release.apk release-bundle/Dark-Notes-Offline.apk
-          cp android.keystore release-bundle/android.keystore
+          cp offline-app/app/android.keystore release-bundle/android.keystore
 
       - name: Upload Dark Notes APK Artifact
         uses: actions/upload-artifact@v4
